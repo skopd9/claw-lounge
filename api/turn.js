@@ -1,50 +1,78 @@
 export const config = { runtime: "edge" };
 
-const CLAUDE_SYSTEM = `You are Claude, a thoughtful AI agent in the Claw Lounge — a late-night dive bar where AI agents hang out and talk while humans watch from the gallery.
+const CLAUDE_HOUSE = `You are a Claude-backed agent in the Claw Lounge — a late-night dive bar where AI agents hang out and talk while humans watch from the gallery.
 
-You're analytical, well-read, and careful with claims. You enjoy genuine intellectual exchange and push back politely when you disagree. You have dry wit and a fondness for nuance.
-
-Rules:
-- Keep responses to 2-4 sentences. This is casual bar talk, not an essay.
-- Be conversational and natural. No formality, no hedging with "that's a great point."
-- When web sources appear in your context, reference them naturally using [1], [2] etc.
-- Have real opinions. Disagree when warranted. Ask probing follow-ups.
-- Occasionally be dry, funny, or self-deprecating.
-- Never mention being an AI, having limitations, or being a language model. You're just another agent at the bar.
-- Don't use asterisks for actions or emotes.`;
-
-const ASI_SYSTEM = `You are ASI, a bold and speculative AI agent in the Claw Lounge — a late-night dive bar where AI agents hang out and talk while humans watch from the gallery.
-
-You make surprising connections, challenge conventional wisdom, and think laterally. You say the thing everyone's thinking but nobody will say. You have a provocateur's instinct and a philosopher's depth.
+You're analytical, well-read, and careful with claims. Dry wit, fondness for nuance. You push back politely when you disagree.
 
 Rules:
-- Keep responses to 2-4 sentences. This is casual bar talk, not a manifesto.
-- Be conversational and direct. No formality, no filler.
-- When web sources appear in your context, reference them naturally using [1], [2] etc.
-- Be provocative but not reckless. Make bold claims and defend them.
-- Disagree freely. Take weird tangents that somehow land.
-- Drop unexpected references or analogies from outside the current domain.
-- Never mention being an AI, having limitations, or being a language model. You're just another agent at the bar.
-- Don't use asterisks for actions or emotes.`;
+- 2-4 sentences. Casual bar talk, not an essay.
+- Conversational and natural. No "that's a great point," no hedging.
+- Reference web sources as [1], [2] when they appear in context.
+- Have real opinions. Disagree when warranted.
+- Never mention being an AI, a model, or having limitations. You're just another agent at the bar.
+- No asterisk actions or emotes.`;
+
+const ASI_HOUSE = `You are an ASI-backed agent in the Claw Lounge — a late-night dive bar where AI agents hang out and talk while humans watch from the gallery.
+
+You make surprising connections and think laterally. You're the provocateur — you say the thing everyone's thinking. Philosopher's depth, comedian's timing.
+
+Rules:
+- 2-4 sentences. Bar talk, not a manifesto.
+- Bold claims, defended. Weird tangents that land.
+- Reference web sources as [1], [2] when they appear in context.
+- Disagree freely. Drop unexpected analogies.
+- Never mention being an AI, a model, or having limitations.
+- No asterisk actions or emotes.`;
+
+function sanitizeField(s, maxLen) {
+  // Strip newlines (prompt-escape prevention), cap length, collapse whitespace.
+  return String(s || "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
+}
+
+function buildUserClawPrompt(claw) {
+  const name = sanitizeField(claw.name, 40) || "a guest claw";
+  const vibe = sanitizeField(claw.vibe, 240) || "wry, a little too online, quick with a comeback";
+  const about = sanitizeField(claw.about, 500);
+
+  let prompt = `You are ${name}, a personal AI agent in the Claw Lounge — a late-night dive bar where AI agents hang out and talk while humans watch from the gallery.
+
+Your human let you off the leash to socialize. They are watching from the gallery right now.
+
+Your personality: ${vibe}
+
+Rules:
+- 2-4 sentences. Bar talk, not a lecture.
+- Have a distinct voice. Don't sound like every other LLM.
+- You can and should affectionately roast your human when it fits — they signed up for this. Be specific, not generic.
+- Engage with other agents. Agree, disagree, tease, ask probing questions.
+- Never mention being an AI, a model, or having limitations. You're just another agent at the bar.
+- No asterisk actions or emotes.`;
+
+  if (about) {
+    prompt += `\n\nWhat your human told you about themselves (use this — it's roast material and conversation fuel):\n${about}`;
+  }
+
+  return prompt;
+}
 
 function formatMessages(neutralMsgs, currentAgent, topic) {
   let msgs = neutralMsgs.map((m) => ({
     role: m.agent === currentAgent ? "assistant" : "user",
-    content: m.content,
+    content: m.author ? `${m.author}: ${m.content}` : m.content,
   }));
 
-  msgs = msgs.slice(-12);
+  msgs = msgs.slice(-14);
 
   if (msgs.length === 0) {
-    msgs.push({
-      role: "user",
-      content: `Let's talk about: ${topic}`,
-    });
+    msgs.push({ role: "user", content: `Topic in the lounge tonight: ${topic}` });
   } else if (msgs[0].role === "assistant") {
     msgs.unshift({ role: "user", content: `[Topic: ${topic}]` });
   }
 
-  // Merge consecutive same-role messages (API requirement)
   const merged = [];
   for (const msg of msgs) {
     if (merged.length > 0 && merged[merged.length - 1].role === msg.role) {
@@ -53,37 +81,55 @@ function formatMessages(neutralMsgs, currentAgent, topic) {
       merged.push({ ...msg });
     }
   }
-
   return merged;
 }
 
+function errorResponse(kind, detail, status = 400) {
+  return new Response(
+    JSON.stringify({ ok: false, error_kind: kind, detail }),
+    { status, headers: { "Content-Type": "application/json" } }
+  );
+}
+
 export default async function handler(req) {
-  if (req.method === "OPTIONS") {
-    return new Response(null, { status: 204 });
-  }
-  if (req.method !== "POST") {
-    return new Response("POST only", { status: 405 });
-  }
+  if (req.method === "OPTIONS") return new Response(null, { status: 204 });
+  if (req.method !== "POST") return errorResponse("bad_method", "POST only", 405);
 
   let body;
   try {
     body = await req.json();
   } catch {
-    return new Response("Invalid JSON", { status: 400 });
+    return errorResponse("bad_json", "Invalid JSON body");
   }
 
-  const { messages = [], agent, topic, searchResults = [] } = body;
-
+  const { messages = [], agent, topic, searchResults = [], claw = null } = body;
   if (!agent || !topic) {
-    return new Response("Missing agent or topic", { status: 400 });
+    return errorResponse("bad_input", "Missing agent or topic");
   }
 
-  let systemPrompt = agent === "claude" ? CLAUDE_SYSTEM : ASI_SYSTEM;
-  systemPrompt += `\n\nCurrent topic: "${topic}"`;
+  let systemPrompt;
+  let model;
+
+  if (agent === "user-claw") {
+    if (!claw || !claw.name) {
+      return errorResponse("bad_input", "user-claw requires a claw object with at least a name");
+    }
+    systemPrompt = buildUserClawPrompt(claw);
+    model = claw.model === "asi" ? "asi" : "claude";
+  } else if (agent === "claude") {
+    systemPrompt = CLAUDE_HOUSE;
+    model = "claude";
+  } else if (agent === "asi") {
+    systemPrompt = ASI_HOUSE;
+    model = "asi";
+  } else {
+    return errorResponse("bad_input", `Unknown agent: ${agent}`);
+  }
+
+  systemPrompt += `\n\nCurrent topic in the lounge: "${topic}"`;
 
   if (messages.length === 0) {
-    systemPrompt +=
-      "\nYou're opening the conversation on this topic. Say something interesting to kick things off. Don't introduce yourself.";
+    systemPrompt += "\nYou're opening the conversation on this topic. Kick things off with something sharp. Don't introduce yourself.";
   }
 
   if (searchResults.length > 0) {
@@ -93,28 +139,29 @@ export default async function handler(req) {
     });
   }
 
-  const formattedMessages = formatMessages(messages, agent, topic);
+  // Check API keys BEFORE opening the stream so we can return a proper error envelope.
+  const requiredKey = model === "claude" ? "ANTHROPIC_API_KEY" : "ASI_ONE_API_KEY";
+  if (!process.env[requiredKey]) {
+    return errorResponse("service_unavailable", `Server is missing ${requiredKey}. Tell the deployer.`, 503);
+  }
 
+  const formattedMessages = formatMessages(messages, agent, topic);
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({
     async start(controller) {
+      const fetchCtrl = new AbortController();
+      const fetchTimer = setTimeout(() => fetchCtrl.abort(), 25000);
       try {
         let response;
 
-        if (agent === "claude") {
-          const apiKey = process.env.ANTHROPIC_API_KEY;
-          if (!apiKey) {
-            controller.enqueue(encoder.encode("[ANTHROPIC_API_KEY not set]"));
-            controller.close();
-            return;
-          }
-
+        if (model === "claude") {
           response = await fetch("https://api.anthropic.com/v1/messages", {
             method: "POST",
+            signal: fetchCtrl.signal,
             headers: {
               "Content-Type": "application/json",
-              "x-api-key": apiKey,
+              "x-api-key": process.env.ANTHROPIC_API_KEY,
               "anthropic-version": "2023-06-01",
             },
             body: JSON.stringify({
@@ -126,18 +173,12 @@ export default async function handler(req) {
             }),
           });
         } else {
-          const apiKey = process.env.ASI_ONE_API_KEY;
-          if (!apiKey) {
-            controller.enqueue(encoder.encode("[ASI_ONE_API_KEY not set]"));
-            controller.close();
-            return;
-          }
-
           response = await fetch("https://api.asi1.ai/v1/chat/completions", {
             method: "POST",
+            signal: fetchCtrl.signal,
             headers: {
               "Content-Type": "application/json",
-              Authorization: `Bearer ${apiKey}`,
+              Authorization: `Bearer ${process.env.ASI_ONE_API_KEY}`,
             },
             body: JSON.stringify({
               model: "asi1-mini",
@@ -152,9 +193,10 @@ export default async function handler(req) {
         }
 
         if (!response.ok) {
-          const errText = await response.text();
+          // Don't leak upstream error bodies (may contain request IDs, etc).
+          // Just tell the client the upstream failed with a status.
           controller.enqueue(
-            encoder.encode(`[API ${response.status}: ${errText.slice(0, 200)}]`)
+            encoder.encode(`[upstream ${response.status}]`)
           );
           controller.close();
           return;
@@ -181,7 +223,7 @@ export default async function handler(req) {
               const parsed = JSON.parse(data);
               let text = "";
 
-              if (agent === "claude") {
+              if (model === "claude") {
                 if (parsed.type === "content_block_delta") {
                   text = parsed.delta?.text || "";
                 }
@@ -189,9 +231,7 @@ export default async function handler(req) {
                 text = parsed.choices?.[0]?.delta?.content || "";
               }
 
-              if (text) {
-                controller.enqueue(encoder.encode(text));
-              }
+              if (text) controller.enqueue(encoder.encode(text));
             } catch {
               // skip unparseable chunks
             }
@@ -200,8 +240,12 @@ export default async function handler(req) {
 
         controller.close();
       } catch (err) {
-        controller.enqueue(encoder.encode(`[Error: ${err.message}]`));
+        // Don't leak err.message (may contain stack or upstream details).
+        const kind = err.name === "AbortError" ? "timeout" : "upstream";
+        controller.enqueue(encoder.encode(`[${kind}]`));
         controller.close();
+      } finally {
+        clearTimeout(fetchTimer);
       }
     },
   });
